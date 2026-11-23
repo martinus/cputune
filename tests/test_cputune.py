@@ -187,6 +187,22 @@ class ShowTest(Case):
         end = next(i for i, line in enumerate(lines) if "all values in MHz" in line)
         return "\n".join(lines[:start]), lines[start:end + 1]
 
+    def test_compact_header(self) -> None:
+        # The kernel is on the line of the CPU model, right-aligned to the table; the GHz labels are in
+        # the header row of the table, not on a line of their own.
+        lines = self.run_tool("show", "--color", "never", columns=120).stdout.splitlines()
+        kernel = (self.root / "proc/sys/kernel/osrelease").read_text().strip()
+        self.assertTrue(lines[0].startswith("13th Gen Intel"), lines[0])
+        self.assertTrue(lines[0].endswith(f"kernel {kernel}"), lines[0])
+        self.assertEqual(lines[2], "")
+        head = lines[3]
+        self.assertTrue(head.startswith("rank  cpus") and "0 GHz" in head, head)
+        self.assertEqual(head.index("0 GHz"), head.index("max") + 5)  # where the chart starts
+        table = lines[3:lines.index("", 3)]
+        self.assertEqual(len(lines[0]), max(map(len, table)))
+        narrow = self.run_tool("show", "--color", "never", columns=60).stdout.splitlines()
+        self.assertEqual(narrow[2], f"kernel {kernel}")  # does not fit next to the CPU model
+
     def test_legend_fits_the_terminal(self) -> None:
         for columns in (40, 60, 70, 200):  # 70: the first three marks fill exactly 70 columns
             with self.subTest(columns=columns):
@@ -507,6 +523,21 @@ class LockAcpiTest(Case):
         self.set_f(2, "scaling_available_frequencies", "3100000 2200000 1500000")
         self.set_f(34, "scaling_available_frequencies", "3100000 2200000 1500000")
         self.assertEqual(self.json("lock", "--cpu", "2")["cores"][0]["target_mhz"], 3100)
+
+    def test_top_pstate_is_no_limit(self) -> None:
+        # Kernel 7.1 keeps scaling_max_freq at the highest P-state (3250, as in the fake tree), below
+        # cpuinfo_max_freq (3800), and the cores still boost to 3800 MHz: the full range, not a limit.
+        self.assertEqual(self.f(1, "scaling_max_freq"), "3250000")
+        out = self.ok("show").stdout
+        rows = [line for line in out.splitlines() if line.startswith(" 255")]
+        self.assertEqual(len(rows), 32)
+        self.assertTrue(all("╍" in row and "─" not in row for row in rows), rows[0])  # boost, no dark part
+        self.assertNotIn("set MHz", out)
+        self.assertNotIn("outside the set range", out)
+        self.ok("limit", "--max", "2400")  # a real limit still shows
+        out = self.ok("show").stdout
+        self.assertIn("1500-2400", out)
+        self.assertIn("outside the set range", out)
 
 
 class LockRaspberryTest(Case):
