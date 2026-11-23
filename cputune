@@ -32,7 +32,7 @@ if TYPE_CHECKING:  # only for type hints: typing makes each start slower
     import threading
     from typing import NoReturn
 
-__version__ = "2.5.1"  # increase it for every change: "cputune update" compares versions
+__version__ = "2.6.0"  # increase it for every change: "cputune update" compares versions
 
 # The latest release, not main: raw.githubusercontent.com caches main for 5 minutes, and a
 # release exists only after the tests passed on main.
@@ -305,12 +305,17 @@ def base_khz(cpu: int, guess: bool = False) -> int | None:
         return value * 1000
     if not guess:
         return None
-    if avail := read_str(d / "scaling_available_frequencies"):  # acpi-cpufreq P-states
-        try:
-            return max(int(f) for f in avail.split())
-        except ValueError:
-            pass
-    return read_int(d / "cpuinfo_max_freq")
+    return top_pstate_khz(cpu) or read_int(d / "cpuinfo_max_freq")
+
+
+def top_pstate_khz(cpu: int) -> int | None:
+    """acpi-cpufreq: the highest P-state in kHz (the base frequency). Software cannot set more:
+    the kernel keeps scaling_max_freq there, and with boost on, the hardware goes above it.
+    None for other drivers."""
+    try:
+        return max(int(f) for f in (read_str(fdir(cpu) / "scaling_available_frequencies") or "").split())
+    except ValueError:
+        return None
 
 
 def boost_switch(cpu: int) -> tuple[Path, str, str] | None:
@@ -345,12 +350,13 @@ CORE_FREQ_FILES = (("hw_min", "cpuinfo_min_freq"), ("hw_max", "cpuinfo_max_freq"
 class Core:
     """One physical core, with all its SMT siblings. Frequencies are in MHz, 0 = unknown."""
 
-    __slots__ = ("cpus", "rank", "hw_min", "hw_max", "base", "set_min", "set_max", "now")
+    __slots__ = ("cpus", "rank", "hw_min", "hw_max", "base", "set_min", "set_max", "top_pstate", "now")
 
     def __init__(self, cpus: tuple[int, ...], rank: int, hw_min: int = 0, hw_max: int = 0,
-                 base: int | None = None, set_min: int = 0, set_max: int = 0) -> None:
+                 base: int | None = None, set_min: int = 0, set_max: int = 0, top_pstate: int = 0) -> None:
         self.cpus, self.rank, self.base = cpus, rank, base
         self.hw_min, self.hw_max, self.set_min, self.set_max = hw_min, hw_max, set_min, set_max
+        self.top_pstate = top_pstate  # acpi-cpufreq, see top_pstate_khz; else 0
         self.now: int | None = None
 
     @property
@@ -362,8 +368,18 @@ class Core:
         return self.has_freq and self.set_min == self.set_max
 
     @property
+    def open_max(self) -> int:
+        """The set maximum that means "no limit": hw_max, or the highest P-state of acpi-cpufreq."""
+        return min(self.hw_max, self.top_pstate) if self.top_pstate else self.hw_max
+
+    @property
+    def reach_max(self) -> int:
+        """The highest frequency that the set range allows."""
+        return self.hw_max if self.set_max >= self.open_max else self.set_max
+
+    @property
     def limited(self) -> bool:
-        return self.has_freq and (self.set_min, self.set_max) != (self.hw_min, self.hw_max)
+        return self.has_freq and (self.set_min != self.hw_min or self.set_max < self.open_max)
 
     def to_json(self) -> dict:
         return {
@@ -398,7 +414,8 @@ def get_cores() -> list[Core]:
         first = cpus[0]
         base = base_khz(first)
         mhz = {attr: (read_int(fdir(first) / name) or 0) // 1000 for attr, name in CORE_FREQ_FILES}
-        cores.append(Core(cpus, get_rank(first), base=base // 1000 if base else None, **mhz))
+        top = (top_pstate_khz(first) or 0) // 1000
+        cores.append(Core(cpus, get_rank(first), base=base // 1000 if base else None, top_pstate=top, **mhz))
     cores.sort(key=lambda c: (-c.rank, c.cpus))
     return cores
 
@@ -577,7 +594,7 @@ def bar(core: Core, scale: int, width: int, now: int | None) -> str:
 
     for i in range(cell(core.hw_min), cell(core.hw_max) + 1):
         mhz = (i + 0.5) * scale / width
-        if mhz < core.set_min - scale / width or mhz > core.set_max + scale / width:
+        if mhz < core.set_min - scale / width or mhz > core.reach_max + scale / width:
             cells[i] = ("─", (DARK,))
         elif core.base and mhz > core.base + scale / width / 2:
             cells[i] = ("╍", (ORANGE,))
@@ -604,23 +621,29 @@ def bar(core: Core, scale: int, width: int, now: int | None) -> str:
 
 
 def axis(scale: int, width: int, step: int) -> str:
-    """Tick labels above the chart, for example "0     1     2  GHz"."""
-    chars = [" "] * (width + 5)
+    """Tick labels for the header row of the chart, width characters: "0 GHz     2     4"."""
+    chars = [" "] * width
     for mhz in range(0, scale + 1, step):
-        label = f"{mhz / 1000:g}"
+        label = f"{mhz / 1000:g}" + (" GHz" if mhz == 0 else "")
         pos = min(width - 1, int(mhz / scale * width))
         if pos + len(label) <= len(chars) and all(c == " " for c in chars[max(0, pos - 1) : pos + len(label)]):
             chars[pos : pos + len(label)] = label
-    return "".join(chars).rstrip() + " GHz"
+    return "".join(chars)
+
+
+def visible_len(text: str) -> int:
+    """The length of text on the terminal, without color codes."""
+    return len(re.sub(r"\033\[[0-9;]*m", "", text))
 
 
 def render_show(cores: list[Core], info: dict, measured: bool, changed: list[int] | None) -> list[str]:
     """The show text. changed: the CPUs that cputune changed (state_cpus())."""
-    lines = render_header(cores, info)
     if not cores:
-        return [*lines, "No CPU topology found in sysfs."]
+        return [*render_header(cores, info, 0), "No CPU topology found in sysfs."]
     freq = [c for c in cores if c.has_freq]
-    lines += render_table(cores, freq, measured)
+    table = render_table(cores, freq, measured)
+    lines = render_header(cores, info, max(map(visible_len, table)))
+    lines += table
     if freq:
         lines += ["", *render_legend(freq, measured)]
     if changed is not None:
@@ -630,8 +653,9 @@ def render_show(cores: list[Core], info: dict, measured: bool, changed: list[int
     return lines
 
 
-def render_header(cores: list[Core], info: dict) -> list[str]:
-    """CPU model, driver, governor, EPP, boost and kernel, then an empty line."""
+def render_header(cores: list[Core], info: dict, width: int) -> list[str]:
+    """CPU model and kernel (right-aligned to width, the width of the table), then driver, governor,
+    EPP and boost, then an empty line."""
     def kv(key: str, value: str) -> str:
         return f"{paint(key, GRAY)} {value}"
 
@@ -656,7 +680,12 @@ def render_header(cores: list[Core], info: dict) -> list[str]:
     parts.append(kv("boost", boost))
     lines = [model, paint(" · ", DARK).join(parts)]
     if info["kernel"]:
-        lines.append(kv("kernel", paint(info["kernel"], WHITE)))
+        kernel = kv("kernel", paint(info["kernel"], WHITE))
+        gap = max(3, width - visible_len(model) - visible_len(kernel))
+        if visible_len(model) + gap + visible_len(kernel) < shutil.get_terminal_size((100, 24)).columns:
+            lines[0] += " " * gap + kernel
+        else:
+            lines.append(kernel)  # too long for one line
     return [*lines, ""]
 
 
@@ -706,9 +735,8 @@ def render_table(cores: list[Core], freq: list[Core], measured: bool) -> list[st
     scale = math.ceil(top / step) * step
     lo_rank, hi_rank = min(c.rank for c in cores), max(c.rank for c in cores)
 
-    if freq:
-        lines.append(" " * left_w + paint(axis(scale, width, step), GRAY))
-    head = f"{'rank':>4}  {'cpus':<{cpus_w}}   {'min':>5} {'base':>5} {'max':>5}  " + " " * width
+    chart_head = axis(scale, width, step) if freq else " " * width
+    head = f"{'rank':>4}  {'cpus':<{cpus_w}}   {'min':>5} {'base':>5} {'max':>5}  " + chart_head
     if show_set:
         head += f"  {'set MHz':>10}"
     if measured:

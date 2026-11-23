@@ -111,7 +111,11 @@ def build(root: Path, name: str) -> Machine:
                 # lowest_nonlinear_perf 85, nominal_perf 127, as on the Ryzen 9 7950X
                 w(f / "amd_pstate_lowest_nonlinear_freq", base * 1000 * 85 // 127)
             if m.driver == "acpi-cpufreq":
-                w(f / "scaling_available_frequencies", f"{base * 1000} 2200000 {min_mhz * 1000}")
+                w(f / "scaling_available_frequencies", f"{base * 1000} 2300000 {min_mhz * 1000}")
+                # As on the EPYC 9354P with kernel 7.1: the kernel keeps scaling_max_freq at the
+                # highest P-state, also after a write of cpuinfo_max_freq. Boost goes above it.
+                w(f / "scaling_max_freq", base * 1000)
+                w(f / "bios_limit", base * 1000)
     if m.driver == "intel_pstate":
         w(cpu_base / "intel_pstate/no_turbo", 0)
     elif m.turbo != "unknown":
